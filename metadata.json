@@ -1,0 +1,8 @@
+{
+  "name": "Board Exam Study Tracker",
+  "description": "Centralized study tracking application and CPA candidate ledger compatible with Google Apps Script Web Apps and Google Sheets sidebar, featuring hierarchical syllabus, time logging, scores, and diagnostic analytics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
