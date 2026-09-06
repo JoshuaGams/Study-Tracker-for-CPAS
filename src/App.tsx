@@ -1,7 +1,17 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { ApplicationState, TimeLog, UserAccount, DashboardTheme } from './types';
 import { loadSavedState, saveStateToStorage, initialBlankState } from './lib/storage';
-import { getActiveSessionUser, loadUserState, saveUserState, logoutUser, setActiveSessionUser, updateUserAccount, isAppAdmin } from './lib/auth';
+import {
+  getActiveSessionUser,
+  loadUserState,
+  saveUserState,
+  logoutUser,
+  setActiveSessionUser,
+  updateUserAccount,
+  isAppAdmin,
+  syncUsersFromRemote,
+  syncUserStateFromRemote,
+} from './lib/auth';
 import { applyThemeToDocument, DEFAULT_THEME } from './lib/theme';
 import { Navbar } from './components/Navbar';
 import { TopicOverview } from './components/TopicOverview';
@@ -72,15 +82,38 @@ function AppContent() {
   const [isThemeModalOpen, setIsThemeModalOpen] = useState(false);
   const [isAppsScriptModalOpen, setIsAppsScriptModalOpen] = useState(false);
 
-  // Initial load from Google Apps Script if running in GAS context
+  // Initial load & cross-profile sync from remote cloud (Server or GAS)
   useEffect(() => {
+    // 1. Synchronize all registered user accounts from remote so any account created in another Chrome profile is recognized
+    syncUsersFromRemote().catch((err) => {
+      console.warn('Initial users remote sync notice:', err);
+    });
+
+    // 2. If a session is already active, synchronize that user's latest saved edits & progress from remote
+    const activeUser = getActiveSessionUser();
+    if (activeUser) {
+      syncUserStateFromRemote(activeUser.id)
+        .then((remoteState) => {
+          if (remoteState) {
+            setState((prev) => ({
+              ...prev,
+              ...remoteState,
+              currentUser: prev.currentUser || activeUser,
+              theme: activeUser.theme || remoteState.theme || prev.theme,
+            }));
+          }
+        })
+        .catch((err) => {
+          console.warn('User state remote sync notice:', err);
+        });
+    }
+
+    // 3. If running in Google Apps Script context, also listen to GAS properties
     if (isRunningInAppsScript()) {
       loadStateFromGAS()
         .then((gasData) => {
           if (gasData) {
             setState((prev) => {
-              // Never accept currentUser from Google Apps Script cloud properties;
-              // user authentication must remain local per session/device.
               const { currentUser: _ignored, ...safeGasData } = gasData as any;
               return {
                 ...prev,
@@ -149,7 +182,18 @@ function AppContent() {
         isPaused: false,
       },
     });
-    showToast('Welcome back, ' + user.name + '!', 'Your candidate review syllabus has been restored.', 'success');
+    showToast('Welcome back, ' + user.name + '!', 'Your candidate review syllabus and progress have been restored.', 'success');
+
+    // Asynchronously double-check for latest remote edits
+    syncUserStateFromRemote(user.id).then((freshState) => {
+      if (freshState) {
+        setState((prev) => ({
+          ...prev,
+          ...freshState,
+          currentUser: user,
+        }));
+      }
+    }).catch(() => {});
   };
 
   // Handle saving new theme

@@ -1,4 +1,4 @@
-import { ApplicationState } from '../types';
+import { ApplicationState, UserAccount } from '../types';
 
 // Global declaration for Google Apps Script client runner
 declare global {
@@ -115,6 +115,118 @@ export function saveStateToGAS(state: ApplicationState): Promise<boolean> {
 }
 
 /**
+ * Load registered users list from Google Apps Script ScriptProperties (chunk-safe)
+ */
+export function gasGetUsers(): Promise<UserAccount[] | null> {
+  return new Promise((resolve) => {
+    if (!isRunningInAppsScript()) {
+      resolve(null);
+      return;
+    }
+    try {
+      if (typeof (window.google?.script?.run as any)?.loadUsersFromGAS === 'function') {
+        (window.google!.script!.run as any)
+          .withSuccessHandler((res: string | null) => {
+            if (!res) return resolve(null);
+            try {
+              const parsed = JSON.parse(res);
+              resolve(Array.isArray(parsed) ? parsed : null);
+            } catch {
+              resolve(null);
+            }
+          })
+          .withFailureHandler(() => resolve(null))
+          .loadUsersFromGAS();
+      } else {
+        resolve(null);
+      }
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+/**
+ * Save registered users list to Google Apps Script ScriptProperties (chunk-safe)
+ */
+export function gasSaveUsers(users: UserAccount[]): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (!isRunningInAppsScript()) {
+      resolve(false);
+      return;
+    }
+    try {
+      if (typeof (window.google?.script?.run as any)?.saveUsersToGAS === 'function') {
+        (window.google!.script!.run as any)
+          .withSuccessHandler(() => resolve(true))
+          .withFailureHandler(() => resolve(false))
+          .saveUsersToGAS(JSON.stringify(users));
+      } else {
+        resolve(false);
+      }
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+/**
+ * Load a user's study state from Google Apps Script ScriptProperties
+ */
+export function gasGetUserState(userId: string): Promise<any | null> {
+  return new Promise((resolve) => {
+    if (!isRunningInAppsScript()) {
+      resolve(null);
+      return;
+    }
+    try {
+      if (typeof (window.google?.script?.run as any)?.loadUserStateFromGAS === 'function') {
+        (window.google!.script!.run as any)
+          .withSuccessHandler((res: string | null) => {
+            if (!res) return resolve(null);
+            try {
+              const parsed = JSON.parse(res);
+              resolve(parsed);
+            } catch {
+              resolve(null);
+            }
+          })
+          .withFailureHandler(() => resolve(null))
+          .loadUserStateFromGAS(userId);
+      } else {
+        resolve(null);
+      }
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+/**
+ * Save a user's study state to Google Apps Script ScriptProperties (chunk-safe)
+ */
+export function gasSaveUserState(userId: string, state: any): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (!isRunningInAppsScript()) {
+      resolve(false);
+      return;
+    }
+    try {
+      if (typeof (window.google?.script?.run as any)?.saveUserStateToGAS === 'function') {
+        (window.google!.script!.run as any)
+          .withSuccessHandler(() => resolve(true))
+          .withFailureHandler(() => resolve(false))
+          .saveUserStateToGAS(userId, JSON.stringify(state));
+      } else {
+        resolve(false);
+      }
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+/**
  * Push structured data directly into Google Sheets tabs
  */
 export function syncDataToGoogleSheets(state: ApplicationState): Promise<string> {
@@ -214,17 +326,82 @@ function showTrackerDialog() {
 }
 
 /**
- * Retrieves saved JSON study state from UserProperties
+ * Chunk-safe storage helpers for ScriptProperties (bypasses 9KB property limit)
+ */
+function saveChunkedProperty_(baseKey, str) {
+  var props = PropertiesService.getScriptProperties();
+  if (!str) {
+    props.deleteProperty(baseKey + '_count');
+    props.deleteProperty(baseKey);
+    return;
+  }
+  var CHUNK_SIZE = 8000;
+  var totalChunks = Math.ceil(str.length / CHUNK_SIZE);
+  props.setProperty(baseKey + '_count', String(totalChunks));
+  for (var i = 0; i < totalChunks; i++) {
+    var chunk = str.substring(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+    props.setProperty(baseKey + '_' + i, chunk);
+  }
+  var oldI = totalChunks;
+  while (props.getProperty(baseKey + '_' + oldI) !== null) {
+    props.deleteProperty(baseKey + '_' + oldI);
+    oldI++;
+    if (oldI > totalChunks + 10) break;
+  }
+}
+
+function loadChunkedProperty_(baseKey) {
+  var props = PropertiesService.getScriptProperties();
+  var countStr = props.getProperty(baseKey + '_count');
+  if (!countStr) {
+    return props.getProperty(baseKey);
+  }
+  var count = parseInt(countStr, 10);
+  var result = '';
+  for (var i = 0; i < count; i++) {
+    var part = props.getProperty(baseKey + '_' + i);
+    if (part) {
+      result += part;
+    }
+  }
+  return result;
+}
+
+/**
+ * Multi-user account sync in Google Apps Script (shared across all Chrome profiles & devices)
+ */
+function saveUsersToGAS(usersJson) {
+  saveChunkedProperty_('CPALE_USERS_V3', usersJson);
+  return true;
+}
+
+function loadUsersFromGAS() {
+  return loadChunkedProperty_('CPALE_USERS_V3') || null;
+}
+
+/**
+ * Multi-user study progress & syllabus state in Google Apps Script
+ */
+function saveUserStateToGAS(userId, stateJson) {
+  var cleanId = String(userId).replace(/[^a-zA-Z0-9_-]/g, '_');
+  saveChunkedProperty_('CPALE_USER_DATA_' + cleanId, stateJson);
+  return true;
+}
+
+function loadUserStateFromGAS(userId) {
+  var cleanId = String(userId).replace(/[^a-zA-Z0-9_-]/g, '_');
+  return loadChunkedProperty_('CPALE_USER_DATA_' + cleanId) || null;
+}
+
+/**
+ * Retrieves saved JSON study state from ScriptProperties / UserProperties
  */
 function getStudyData() {
   try {
-    var userProperties = PropertiesService.getUserProperties();
-    var data = userProperties.getProperty(STUDY_STORAGE_KEY);
+    var data = loadChunkedProperty_(STUDY_STORAGE_KEY);
     if (!data) {
-      var docProperties = PropertiesService.getDocumentProperties();
-      if (docProperties) {
-        data = docProperties.getProperty(STUDY_STORAGE_KEY);
-      }
+      var userProperties = PropertiesService.getUserProperties();
+      data = userProperties.getProperty(STUDY_STORAGE_KEY);
     }
     return data || null;
   } catch (err) {
@@ -234,22 +411,11 @@ function getStudyData() {
 }
 
 /**
- * Persists JSON study state into UserProperties and DocumentProperties
+ * Persists JSON study state into ScriptProperties (chunk-safe)
  */
 function saveStudyData(jsonPayload) {
   try {
-    var userProperties = PropertiesService.getUserProperties();
-    userProperties.setProperty(STUDY_STORAGE_KEY, jsonPayload);
-    
-    // Also save to active spreadsheet document properties if attached
-    try {
-      var docProperties = PropertiesService.getDocumentProperties();
-      if (docProperties) {
-        docProperties.setProperty(STUDY_STORAGE_KEY, jsonPayload);
-      }
-    } catch (e) {
-      // Standalone web app mode might not have document properties
-    }
+    saveChunkedProperty_(STUDY_STORAGE_KEY, jsonPayload);
     return true;
   } catch (err) {
     Logger.log('Error in saveStudyData: ' + err);

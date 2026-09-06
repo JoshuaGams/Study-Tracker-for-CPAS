@@ -1,5 +1,12 @@
 import { UserAccount, ApplicationState } from '../types';
 import { initialBlankState, sampleCPALEData, getCleanCPALESyllabus } from './storage';
+import {
+  isRunningInAppsScript,
+  gasGetUsers,
+  gasSaveUsers,
+  gasGetUserState,
+  gasSaveUserState,
+} from './appsScriptAdapter';
 
 const USERS_KEY = 'cpale_tracker_users_v3';
 const ACTIVE_SESSION_KEY = 'cpale_tracker_active_session_v3';
@@ -167,12 +174,82 @@ export function getRegisteredUsers(): UserAccount[] {
   }
 }
 
+export function pushUsersToRemote(users: UserAccount[]): void {
+  try {
+    if (isRunningInAppsScript()) {
+      gasSaveUsers(users).catch((err) => console.warn('GAS users sync notice:', err));
+    } else if (typeof window !== 'undefined') {
+      fetch('/api/users', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ users }),
+      }).catch((err) => console.warn('Server users sync notice:', err));
+    }
+  } catch (err) {
+    console.warn('Failed to push users remotely:', err);
+  }
+}
+
 export function saveRegisteredUsers(users: UserAccount[]): void {
   try {
     localStorage.setItem(USERS_KEY, JSON.stringify(users));
   } catch (err) {
     console.error('Failed to save registered users:', err);
   }
+  pushUsersToRemote(users);
+}
+
+/**
+ * Synchronize registered users across all Chrome profiles, devices, and sessions
+ */
+export async function syncUsersFromRemote(): Promise<UserAccount[]> {
+  try {
+    let remoteUsers: UserAccount[] | null = null;
+    if (isRunningInAppsScript()) {
+      remoteUsers = await gasGetUsers();
+    } else if (typeof window !== 'undefined') {
+      const res = await fetch('/api/users');
+      if (res.ok) {
+        const json = await res.json();
+        if (json.success && Array.isArray(json.users)) {
+          remoteUsers = json.users;
+        }
+      }
+    }
+
+    if (remoteUsers && Array.isArray(remoteUsers) && remoteUsers.length > 0) {
+      const localUsers = getRegisteredUsers();
+      const userMap = new Map<string, UserAccount>();
+
+      // Populate local accounts first
+      localUsers.forEach((u) => userMap.set(u.id, u));
+
+      // Merge remote accounts
+      remoteUsers.forEach((ru) => {
+        if (!userMap.has(ru.id)) {
+          userMap.set(ru.id, ru);
+        } else {
+          const local = userMap.get(ru.id)!;
+          userMap.set(ru.id, {
+            ...local,
+            ...ru,
+            passwordHash: ru.passwordHash || local.passwordHash,
+          });
+        }
+      });
+
+      const mergedList = Array.from(userMap.values());
+      try {
+        localStorage.setItem(USERS_KEY, JSON.stringify(mergedList));
+      } catch (err) {
+        console.warn('Failed to cache merged users locally:', err);
+      }
+      return mergedList;
+    }
+  } catch (err) {
+    console.warn('Notice: Remote user sync encountered an issue (using local cache):', err);
+  }
+  return getRegisteredUsers();
 }
 
 export function getActiveSessionUser(): UserAccount | null {
@@ -263,6 +340,22 @@ export function loadUserState(userId: string): ApplicationState {
 
 let userSaveDebounceTimer: any = null;
 
+export function pushUserStateToRemote(userId: string, payload: any): void {
+  try {
+    if (isRunningInAppsScript()) {
+      gasSaveUserState(userId, payload).catch((err) => console.warn('GAS state sync notice:', err));
+    } else if (typeof window !== 'undefined') {
+      fetch(`/api/user-state/${encodeURIComponent(userId)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ state: payload }),
+      }).catch((err) => console.warn('Server state sync notice:', err));
+    }
+  } catch (err) {
+    console.warn('Failed to push state remotely:', err);
+  }
+}
+
 export function saveUserState(userId: string, state: ApplicationState, immediate = false): void {
   const doSave = () => {
     try {
@@ -279,6 +372,7 @@ export function saveUserState(userId: string, state: ApplicationState, immediate
         lastSaved: new Date().toISOString(),
       };
       localStorage.setItem(USER_DATA_PREFIX + userId, JSON.stringify(payload));
+      pushUserStateToRemote(userId, payload);
     } catch (err) {
       console.error('Failed to persist user state for', userId, err);
     }
@@ -291,6 +385,66 @@ export function saveUserState(userId: string, state: ApplicationState, immediate
     if (userSaveDebounceTimer) clearTimeout(userSaveDebounceTimer);
     userSaveDebounceTimer = setTimeout(doSave, 800);
   }
+}
+
+/**
+ * Synchronize a specific user's study state from remote (GAS or Server)
+ * This ensures edits & progress made on Chrome Profile A load seamlessly in Chrome Profile B!
+ */
+export async function syncUserStateFromRemote(userId: string): Promise<ApplicationState | null> {
+  try {
+    let remotePayload: any = null;
+    if (isRunningInAppsScript()) {
+      remotePayload = await gasGetUserState(userId);
+    } else if (typeof window !== 'undefined') {
+      const res = await fetch(`/api/user-state/${encodeURIComponent(userId)}`);
+      if (res.ok) {
+        const json = await res.json();
+        if (json.success && json.state) {
+          remotePayload = json.state;
+        }
+      }
+    }
+
+    if (remotePayload) {
+      const localRaw = localStorage.getItem(USER_DATA_PREFIX + userId);
+      const localParsed = localRaw ? JSON.parse(localRaw) : null;
+
+      const remoteTime = remotePayload.lastSaved ? new Date(remotePayload.lastSaved).getTime() : 0;
+      const localTime = localParsed?.lastSaved ? new Date(localParsed.lastSaved).getTime() : 0;
+
+      // If remote has data and (local has none or remote is at least as new)
+      if (!localParsed || remoteTime >= localTime || !localParsed.mainTopics || localParsed.mainTopics.length === 0) {
+        const users = getRegisteredUsers();
+        const user = users.find((u) => u.id === userId);
+        const resolved: ApplicationState = {
+          ...initialBlankState,
+          ...remotePayload,
+          currentUser: user || remotePayload.currentUser || null,
+          mainTopics: Array.isArray(remotePayload.mainTopics) ? remotePayload.mainTopics : [],
+          subtopics: Array.isArray(remotePayload.subtopics) ? remotePayload.subtopics : [],
+          resources: Array.isArray(remotePayload.resources) ? remotePayload.resources : [],
+          examScores: Array.isArray(remotePayload.examScores) ? remotePayload.examScores : [],
+          timeLogs: Array.isArray(remotePayload.timeLogs) ? remotePayload.timeLogs : [],
+          timerState: {
+            ...initialBlankState.timerState,
+            ...(remotePayload.timerState || {}),
+            isRunning: false,
+            isPaused: false,
+          },
+        };
+        try {
+          localStorage.setItem(USER_DATA_PREFIX + userId, JSON.stringify(remotePayload));
+        } catch (err) {
+          console.warn('Could not cache remote state locally:', err);
+        }
+        return resolved;
+      }
+    }
+  } catch (err) {
+    console.warn('Notice: Remote user-state sync encountered an issue:', err);
+  }
+  return null;
 }
 
 export interface SignUpParams {
@@ -319,7 +473,8 @@ export async function registerUser(params: SignUpParams): Promise<{ success: boo
     return { success: false, error: 'Password must be at least 6 characters long.' };
   }
 
-  const users = getRegisteredUsers();
+  // Pre-sync with remote to avoid duplicate registrations across browser profiles
+  let users = await syncUsersFromRemote();
   const alreadyExists = users.some(
     (u) =>
       (u.username && u.username.toLowerCase() === cleanUsername) ||
@@ -372,7 +527,7 @@ export async function registerUser(params: SignUpParams): Promise<{ success: boo
     };
   }
 
-  // Save new user state immediately to their private storage slot
+  // Save new user state immediately to their private storage slot AND sync to remote
   saveUserState(newUser.id, initialState, true);
   setActiveSessionUser(newUser);
 
@@ -388,7 +543,7 @@ export async function loginUser(username: string, password: string): Promise<{ s
     return { success: false, error: 'Please enter your password.' };
   }
 
-  const users = getRegisteredUsers();
+  let users = getRegisteredUsers();
   // Find matching user by username (or fallback legacy email)
   let user = users.find(
     (u) =>
@@ -399,6 +554,23 @@ export async function loginUser(username: string, password: string): Promise<{ s
   // If user entered admin alias
   if (!user && (cleanUsername === 'admin@cpale.com' || cleanUsername === 'admin' || cleanUsername === 'candidate@cpale.ph')) {
     user = users.find((u) => u.role === 'owner' || u.id === 'usr_admin_cpale' || u.id === 'usr_demo_cpale');
+  }
+
+  // If not found in local profile storage, pull latest users from remote!
+  // (This is critical when user opens a new Chrome profile or different browser)
+  if (!user) {
+    const syncedUsers = await syncUsersFromRemote();
+    user = syncedUsers.find(
+      (u) =>
+        (u.username && u.username.toLowerCase() === cleanUsername) ||
+        (u.email && u.email.toLowerCase() === cleanUsername)
+    );
+    if (!user && (cleanUsername === 'admin@cpale.com' || cleanUsername === 'admin' || cleanUsername === 'candidate@cpale.ph')) {
+      user = syncedUsers.find((u) => u.role === 'owner' || u.id === 'usr_admin_cpale' || u.id === 'usr_demo_cpale');
+    }
+    if (user) {
+      users = syncedUsers;
+    }
   }
 
   if (!user) {
@@ -429,6 +601,13 @@ export async function loginUser(username: string, password: string): Promise<{ s
   }
   saveRegisteredUsers(users);
   setActiveSessionUser(user);
+
+  // Synchronize remote state into this Chrome profile so all edits & progress load immediately!
+  try {
+    await syncUserStateFromRemote(user.id);
+  } catch (err) {
+    console.warn('Could not sync user state upon login:', err);
+  }
 
   return { success: true, user };
 }
